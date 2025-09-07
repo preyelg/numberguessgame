@@ -1,29 +1,24 @@
 pipeline {
   agent any
 
-  // MUST match Manage Jenkins → Tools
   tools {
-    jdk   'java-17'
+    jdk   'java-17'   // MUST match Manage Jenkins → Tools
     maven 'Maven'
   }
 
   environment {
     REPO_URL         = 'https://github.com/preyelg/numberguessgame.git'
-    REPO_BRANCH      = 'new1'
-
-    SONARQUBE_SERVER = 'SonarQube'      // Manage Jenkins → Configure System
+    REPO_BRANCH      = 'new'
+    SONARQUBE_SERVER = 'SonarQube'                // Manage Jenkins → Configure System
 
     // Nexus 2 base URL (note the /nexus)
     NEXUS_URL        = 'http://18.188.63.155:8081/nexus'
-    NEXUS_CRED_ID    = 'nexus-cred'     // Jenkins credentials ID (Username/Password)
+    NEXUS_CRED_ID    = 'nexus-cred'               // Jenkins credentials ID (Username/Password)
 
-    // Will be set dynamically to 'snapshots' or 'releases'
-    NEXUS_TARGET_REPO = ''
-    
-    // Tomcat deploy target
+    // Tomcat target
     TOMCAT_HOST      = '18.220.246.223'
     TOMCAT_USER      = 'ec2-user'
-    TOMCAT_SSH_ID    = 'tomcat-ssh'     // Jenkins SSH credentials ID
+    TOMCAT_SSH_ID    = 'tomcat-ssh'               // Jenkins SSH credentials ID
     TOMCAT_WEBAPPS   = '/opt/tomcat/webapps'
     APP_NAME         = 'NumberGuessGame'
   }
@@ -55,33 +50,29 @@ pipeline {
       }
     }
 
-    stage('Determine Target Repo') {
+    stage('Publish to Nexus (Nexus 2)') {
       steps {
         timestamps {
           script {
-            // Read version from pom and choose snapshots vs releases
+            // Determine version and choose repo: snapshots for *-SNAPSHOT else releases
             def version = sh(script: "mvn -q -DforceStdout help:evaluate -Dexpression=project.version", returnStdout: true).trim()
-            env.NEXUS_TARGET_REPO = version.endsWith('-SNAPSHOT') ? 'snapshots' : 'releases'
-            echo "Project version: ${version} → deploying to '${env.NEXUS_TARGET_REPO}'"
-          }
-        }
-      }
-    }
+            def targetRepo = version.endsWith('-SNAPSHOT') ? 'snapshots' : 'releases'
+            echo "Project version: ${version} → deploying to '${targetRepo}'"
 
-    stage('Publish to Nexus') {
-      steps {
-        timestamps {
-          withCredentials([usernamePassword(credentialsId: env.NEXUS_CRED_ID, usernameVariable: 'NU', passwordVariable: 'NP')]) {
-            // Single quotes avoid Groovy interpolation of secrets; variables expand in bash
-            sh '''
-              set -e
-              echo "Deploy URL: $NEXUS_URL/content/repositories/$NEXUS_TARGET_REPO/"
-              mvn -B -DskipTests deploy \
-                -DaltDeploymentRepository=${NEXUS_TARGET_REPO}::default::${NEXUS_URL}/content/repositories/${NEXUS_TARGET_REPO}/ \
-                -DrepositoryId=${NEXUS_TARGET_REPO} \
-                -Durl=${NEXUS_URL}/content/repositories/${NEXUS_TARGET_REPO}/ \
-                -Dusername="$NU" -Dpassword="$NP"
-            '''
+            withCredentials([usernamePassword(credentialsId: env.NEXUS_CRED_ID, usernameVariable: 'NU', passwordVariable: 'NP')]) {
+              withEnv(["TARGET_REPO=${targetRepo}"]) {
+                // Single quotes avoid Groovy string interpolation of secrets
+                sh '''
+                  set -e
+                  echo "Deploy URL: $NEXUS_URL/content/repositories/$TARGET_REPO/"
+                  mvn -B -DskipTests deploy \
+                    -DaltDeploymentRepository=${TARGET_REPO}::default::${NEXUS_URL}/content/repositories/${TARGET_REPO}/ \
+                    -DrepositoryId=${TARGET_REPO} \
+                    -Durl=${NEXUS_URL}/content/repositories/${TARGET_REPO}/ \
+                    -Dusername="$NU" -Dpassword="$NP"
+                '''
+              }
+            }
           }
         }
       }
