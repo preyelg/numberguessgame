@@ -1,24 +1,25 @@
 pipeline {
   agent any
 
-  // MUST match names in Manage Jenkins → Tools
+  // MUST match Manage Jenkins → Tools
   tools {
     jdk   'java-17'
     maven 'Maven'
   }
 
   environment {
-    REPO_URL          = 'https://github.com/preyelg/numberguessgame.git'
-    REPO_BRANCH       = 'new'
+    REPO_URL         = 'https://github.com/preyelg/numberguessgame.git'
+    REPO_BRANCH      = 'new'
 
-    // SonarQube (name must match Manage Jenkins → Configure System)
-    SONARQUBE_SERVER  = 'SonarQube'
+    // SonarQube server name as configured in Manage Jenkins → Configure System
+    SONARQUBE_SERVER = 'SonarQube'
 
-    // Remote Tomcat host
-    TOMCAT_HOST       = '18.220.246.223'
-    TOMCAT_USER       = 'ec2-user'
-    TOMCAT_SSH_ID     = 'tomcat-ssh'    // Jenkins credential: SSH Username with private key
-    APP_NAME          = 'NumberGuessGame'
+    // ---- Tomcat settings ----
+    TOMCAT_HOST      = '18.220.246.223'
+    TOMCAT_USER      = 'ec2-user'
+    TOMCAT_SSH_ID    = 'tomcat-ssh'    // SSH Username with private key (Jenkins credential)
+    TOMCAT_WEBAPPS   = '/home/ec2-user/apache-tomcat-7.0.94/webapps'
+    APP_NAME         = 'NumberGuessGame'
   }
 
   stages {
@@ -44,10 +45,8 @@ pipeline {
           withSonarQubeEnv(env.SONARQUBE_SERVER) {
             sh 'mvn -B sonar:sonar'
           }
-          // Optional Quality Gate enforcement (requires Sonar webhook to Jenkins)
-          // timeout(time: 10, unit: 'MINUTES') {
-          //   waitForQualityGate abortPipeline: true
-          // }
+          // Optional: enforce Quality Gate (requires Sonar webhook to Jenkins)
+          // timeout(time: 10, unit: 'MINUTES') { waitForQualityGate abortPipeline: true }
         }
       }
     }
@@ -56,70 +55,53 @@ pipeline {
       steps {
         timestamps {
           script {
-            // Pick the most recent WAR produced by the build
             def war = sh(script: "ls -1 target/*.war | tail -n1", returnStdout: true).trim()
-            if (!war) { error 'No WAR found under target/. Did the build stage run?' }
+            if (!war) { error 'No WAR found under target/ — did the build run?' }
             echo "Deploying WAR: ${war}"
 
-            // Requires SSH Agent plugin + 'tomcat-ssh' credential
             sshagent(credentials: [env.TOMCAT_SSH_ID]) {
               sh """
                 set -e
-
-                # Upload to /tmp on the remote host
+                # Upload to remote /tmp
                 scp -o StrictHostKeyChecking=no "${war}" ${env.TOMCAT_USER}@${env.TOMCAT_HOST}:/tmp/${env.APP_NAME}.war
 
-                # Run deployment logic remotely; escape all \$ so Groovy won't interpolate them
-                ssh -o StrictHostKeyChecking=no ${env.TOMCAT_USER}@${env.TOMCAT_HOST} 'bash -s' <<'EOS'
+                # Remote deploy
+                ssh -o StrictHostKeyChecking=no ${env.TOMCAT_USER}@${env.TOMCAT_HOST} 'bash -s' <<EOS
 set -e
 
-# 1) Find Tomcat webapps directory (try common locations/globs)
-CANDIDATES=(
-  /opt/tomcat/webapps
-  /usr/share/tomcat/webapps
-  /usr/share/tomcat*/webapps
-  /usr/local/tomcat/webapps
-  /var/lib/tomcat/webapps
-  /var/lib/tomcat*/webapps
-)
+WEBAPPS_DIR="${env.TOMCAT_WEBAPPS}"
+APP="${env.APP_NAME}"
 
-WEBAPPS_DIR=""
-for d in "\${CANDIDATES[@]}"; do
-  for p in \$d; do
-    if [ -d "\$p" ]; then WEBAPPS_DIR="\$p"; break 2; fi
-  done
-done
-
-if [ -z "\$WEBAPPS_DIR" ]; then
-  echo "ERROR: Could not locate Tomcat webapps directory on \$(hostname)." >&2
-  echo "Hint: run 'sudo find / -maxdepth 3 -type d -name webapps 2>/dev/null' to locate it." >&2
-  exit 1
-fi
 echo "Using WEBAPPS_DIR: \$WEBAPPS_DIR"
 
-# 2) Drop new WAR
-sudo rm -f  "\$WEBAPPS_DIR/${APP_NAME}.war" || true
-sudo rm -rf "\$WEBAPPS_DIR/${APP_NAME}"     || true
-sudo cp /tmp/${APP_NAME}.war "\$WEBAPPS_DIR/${APP_NAME}.war"
+# Drop new WAR
+rm -f  "\$WEBAPPS_DIR/\$APP.war" || true
+rm -rf "\$WEBAPPS_DIR/\$APP"     || true
+mv /tmp/\$APP.war "\$WEBAPPS_DIR/\$APP.war"
 
-# 3) Fix ownership if a 'tomcat' user exists (best-effort)
-if id tomcat >/dev/null 2>&1; then
-  sudo chown tomcat:tomcat "\$WEBAPPS_DIR/${APP_NAME}.war" || true
-fi
-
-# 4) Restart Tomcat if a known service exists; else rely on auto-deploy
+# Try system service first
 set +e
 for svc in tomcat tomcat9 tomcat8 tomcat7; do
-  if systemctl list-unit-files | grep -q "^\$svc\\.service"; then
-    echo "Restarting service: \$svc (systemd)"
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q "^\$svc\\.service"; then
+    echo "Restarting via systemd: \$svc"
     sudo systemctl restart "\$svc" && exit 0
   fi
   if command -v service >/dev/null 2>&1 && service "\$svc" status >/dev/null 2>&1; then
-    echo "Restarting service: \$svc (SysV)"
+    echo "Restarting via service: \$svc"
     sudo service "\$svc" restart && exit 0
   fi
 done
-echo "No known Tomcat service found; assuming auto-deploy is enabled."
+
+# Fall back to startup/shutdown scripts next to webapps
+CATALINA_BIN="\$(dirname "\$WEBAPPS_DIR")/bin"
+if [ -x "\$CATALINA_BIN/shutdown.sh" ] && [ -x "\$CATALINA_BIN/startup.sh" ]; then
+  echo "Restarting via scripts in \$CATALINA_BIN"
+  "\$CATALINA_BIN/shutdown.sh" || true
+  sleep 5
+  "\$CATALINA_BIN/startup.sh" || true
+else
+  echo "No service or scripts found — relying on Tomcat auto-deploy."
+fi
 exit 0
 EOS
               """
@@ -132,6 +114,6 @@ EOS
 
   post {
     success { echo 'Build, Sonar scan, and Tomcat deploy completed.' }
-    failure { echo 'Pipeline failed. Check logs above for the failing stage.' }
+    failure { echo 'Pipeline failed — check the stage logs above.' }
   }
 }
