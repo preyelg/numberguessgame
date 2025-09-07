@@ -11,18 +11,16 @@ pipeline {
     REPO_URL         = 'https://github.com/preyelg/numberguessgame.git'
     REPO_BRANCH      = 'new'
 
-    SONARQUBE_SERVER = 'SonarQube'                 // Manage Jenkins → Configure System
-
-    // Nexus 2 base URL (note the /nexus)
-    NEXUS_URL        = 'http://18.188.63.155:8081/nexus'
-    NEXUS_CRED_ID    = 'nexus-cred'                // Jenkins Credentials (Username/Password)
+    // Comment this block out if you don't want Sonar at all
+    SONARQUBE_SERVER = 'SonarQube'   // Manage Jenkins → Configure System
 
     // Tomcat deploy target
     TOMCAT_HOST      = '18.220.246.223'
     TOMCAT_USER      = 'ec2-user'
-    TOMCAT_SSH_ID    = 'tomcat-ssh'                // Jenkins SSH key ID
+    TOMCAT_SSH_ID    = 'tomcat-ssh'  // Jenkins SSH credentials ID
     TOMCAT_WEBAPPS   = '/opt/tomcat/webapps'
     APP_NAME         = 'NumberGuessGame'
+    TOMCAT_SERVICE   = 'tomcat'      // change if your service name differs
   }
 
   stages {
@@ -42,6 +40,7 @@ pipeline {
       }
     }
 
+    // Remove this entire stage if you don’t want Sonar
     stage('SonarQube Scan') {
       steps {
         timestamps {
@@ -52,58 +51,28 @@ pipeline {
       }
     }
 
-    stage('Publish to Nexus (Nexus 2)') {
-      steps {
-        timestamps {
-          script {
-            // Decide snapshots vs releases from pom version
-            def version = sh(script: "mvn -q -DforceStdout help:evaluate -Dexpression=project.version", returnStdout: true).trim()
-            def targetRepo = version.endsWith('-SNAPSHOT') ? 'snapshots' : 'releases'
-            echo "Project version: ${version} → deploying to '${targetRepo}'"
-
-            withCredentials([usernamePassword(credentialsId: env.NEXUS_CRED_ID, usernameVariable: 'NU', passwordVariable: 'NP')]) {
-              // Minimal settings.xml so Maven authenticates cleanly
-              writeFile file: 'settings.xml', text: """
-<settings>
-  <servers>
-    <server>
-      <id>${targetRepo}</id>
-      <username>${NU}</username>
-      <password>${NP}</password>
-    </server>
-  </servers>
-</settings>
-"""
-
-              // Quick preflight (prints only HTTP status line)
-              sh """
-                set -e
-                curl -sS -I -u "$NU:$NP" "${NEXUS_URL}/content/repositories/${targetRepo}/" | head -n1
-                echo "Deploy URL: ${NEXUS_URL}/content/repositories/${targetRepo}/"
-                mvn -B -s settings.xml -DskipTests deploy \\
-                  -DaltDeploymentRepository=${targetRepo}::default::${NEXUS_URL}/content/repositories/${targetRepo}/
-                rm -f settings.xml
-              """
-            }
-          }
-        }
-      }
-    }
-
     stage('Deploy to Tomcat') {
       steps {
         timestamps {
           script {
-            def war = sh(script: "ls -1 target/*.war | head -n1", returnStdout: true).trim()
+            // pick the built WAR
+            def war = sh(script: "ls -1 target/*.war | tail -n1", returnStdout: true).trim()
+            if (!war) { error 'No WAR found under target/' }
+
             sshagent([env.TOMCAT_SSH_ID]) {
               sh """
                 set -e
+                echo "Uploading: ${war}"
                 scp -o StrictHostKeyChecking=no "${war}" ${TOMCAT_USER}@${TOMCAT_HOST}:/tmp/app.war
+
                 ssh -o StrictHostKeyChecking=no ${TOMCAT_USER}@${TOMCAT_HOST} '
                   set -e
                   sudo rm -f ${TOMCAT_WEBAPPS}/${APP_NAME}.war || true
                   sudo rm -rf ${TOMCAT_WEBAPPS}/${APP_NAME} || true
                   sudo cp /tmp/app.war ${TOMCAT_WEBAPPS}/${APP_NAME}.war
+                  sudo chown -f tomcat:tomcat ${TOMCAT_WEBAPPS}/${APP_NAME}.war || true
+                  # try restart if your Tomcat needs it
+                  (sudo systemctl restart ${TOMCAT_SERVICE} || sudo service ${TOMCAT_SERVICE} restart || true)
                 '
               """
             }
@@ -114,7 +83,7 @@ pipeline {
   }
 
   post {
-    success { echo 'Build, scan, publish, and deploy completed.' }
-    failure { echo 'Pipeline failed. Check logs for the failing stage.' }
+    success { echo 'Build and deploy to Tomcat completed.' }
+    failure { echo 'Pipeline failed. Check the stage logs above.' }
   }
 }
