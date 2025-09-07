@@ -4,15 +4,15 @@ pipeline {
   options { timestamps() }
 
   environment {
-    REPO_URL        = 'https://github.com/AnnieAifesehi/NumberGuessGame.git'
-    REPO_BRANCH     = 'main'
+    REPO_URL        = 'https://github.com/preyelg/numberguessgame.git'
+    REPO_BRANCH     = 'new'
     SONARQUBE_SERVER= 'SonarQube'
 
     NEXUS_URL       = 'http://54.157.3.135:8081'
     NEXUS_REPO      = 'maven-releases'
     NEXUS_CRED_ID   = 'nexus-cred'
 
-    TOMCAT_HOST     = '3.210.219.27'
+    TOMCAT_HOST     = '13.58.99.62'
     TOMCAT_USER     = 'ec2-user'
     TOMCAT_SSH_ID   = 'tomcat-ssh'
     TOMCAT_WEBAPPS  = '/opt/tomcat/webapps'
