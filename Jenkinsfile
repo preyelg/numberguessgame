@@ -1,24 +1,26 @@
 pipeline {
   agent any
 
+  // MUST match Manage Jenkins → Tools
   tools {
-    jdk   'java-17'   // MUST match Manage Jenkins → Tools
+    jdk   'java-17'
     maven 'Maven'
   }
 
   environment {
     REPO_URL         = 'https://github.com/preyelg/numberguessgame.git'
     REPO_BRANCH      = 'new'
-    SONARQUBE_SERVER = 'SonarQube'                // Manage Jenkins → Configure System
+
+    SONARQUBE_SERVER = 'SonarQube'                 // Manage Jenkins → Configure System
 
     // Nexus 2 base URL (note the /nexus)
     NEXUS_URL        = 'http://18.188.63.155:8081/nexus'
-    NEXUS_CRED_ID    = 'nexus-cred'               // Jenkins credentials ID (Username/Password)
+    NEXUS_CRED_ID    = 'nexus-cred'                // Jenkins Credentials (Username/Password)
 
-    // Tomcat target
+    // Tomcat deploy target
     TOMCAT_HOST      = '18.220.246.223'
     TOMCAT_USER      = 'ec2-user'
-    TOMCAT_SSH_ID    = 'tomcat-ssh'               // Jenkins SSH credentials ID
+    TOMCAT_SSH_ID    = 'tomcat-ssh'                // Jenkins SSH key ID
     TOMCAT_WEBAPPS   = '/opt/tomcat/webapps'
     APP_NAME         = 'NumberGuessGame'
   }
@@ -54,24 +56,34 @@ pipeline {
       steps {
         timestamps {
           script {
-            // Determine version and choose repo: snapshots for *-SNAPSHOT else releases
+            // Decide snapshots vs releases from pom version
             def version = sh(script: "mvn -q -DforceStdout help:evaluate -Dexpression=project.version", returnStdout: true).trim()
             def targetRepo = version.endsWith('-SNAPSHOT') ? 'snapshots' : 'releases'
             echo "Project version: ${version} → deploying to '${targetRepo}'"
 
             withCredentials([usernamePassword(credentialsId: env.NEXUS_CRED_ID, usernameVariable: 'NU', passwordVariable: 'NP')]) {
-              withEnv(["TARGET_REPO=${targetRepo}"]) {
-                // Single quotes avoid Groovy string interpolation of secrets
-                sh '''
-                  set -e
-                  echo "Deploy URL: $NEXUS_URL/content/repositories/$TARGET_REPO/"
-                  mvn -B -DskipTests deploy \
-                    -DaltDeploymentRepository=${TARGET_REPO}::default::${NEXUS_URL}/content/repositories/${TARGET_REPO}/ \
-                    -DrepositoryId=${TARGET_REPO} \
-                    -Durl=${NEXUS_URL}/content/repositories/${TARGET_REPO}/ \
-                    -Dusername="$NU" -Dpassword="$NP"
-                '''
-              }
+              // Minimal settings.xml so Maven authenticates cleanly
+              writeFile file: 'settings.xml', text: """
+<settings>
+  <servers>
+    <server>
+      <id>${targetRepo}</id>
+      <username>${NU}</username>
+      <password>${NP}</password>
+    </server>
+  </servers>
+</settings>
+"""
+
+              // Quick preflight (prints only HTTP status line)
+              sh """
+                set -e
+                curl -sS -I -u "$NU:$NP" "${NEXUS_URL}/content/repositories/${targetRepo}/" | head -n1
+                echo "Deploy URL: ${NEXUS_URL}/content/repositories/${targetRepo}/"
+                mvn -B -s settings.xml -DskipTests deploy \\
+                  -DaltDeploymentRepository=${targetRepo}::default::${NEXUS_URL}/content/repositories/${targetRepo}/
+                rm -f settings.xml
+              """
             }
           }
         }
