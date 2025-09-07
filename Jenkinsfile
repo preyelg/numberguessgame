@@ -1,7 +1,7 @@
 pipeline {
   agent any
 
-  // MUST match names in Manage Jenkins → Tools
+  // MUST match Manage Jenkins → Tools
   tools {
     jdk   'java-17'
     maven 'Maven'
@@ -14,12 +14,10 @@ pipeline {
     // SonarQube (name must match Manage Jenkins → Configure System)
     SONARQUBE_SERVER = 'SonarQube'
 
-    // Tomcat target
+    // Remote Tomcat host
     TOMCAT_HOST    = '18.220.246.223'
     TOMCAT_USER    = 'ec2-user'
-    TOMCAT_SSH_ID  = 'tomcat-ssh'          // Jenkins credential: SSH Username with private key
-    TOMCAT_WEBAPPS = '/opt/tomcat/webapps'
-    TOMCAT_SERVICE = 'tomcat'              // change if different (e.g., tomcat9)
+    TOMCAT_SSH_ID  = 'tomcat-ssh'   // Jenkins credential: SSH Username with private key
     APP_NAME       = 'NumberGuessGame'
   }
 
@@ -46,7 +44,7 @@ pipeline {
           withSonarQubeEnv(env.SONARQUBE_SERVER) {
             sh 'mvn -B sonar:sonar'
           }
-          // Optional: enforce the Quality Gate (requires Sonar webhook to Jenkins)
+          // Optional quality gate block (requires webhook)
           // timeout(time: 10, unit: 'MINUTES') {
           //   waitForQualityGate abortPipeline: true
           // }
@@ -58,7 +56,7 @@ pipeline {
       steps {
         timestamps {
           script {
-            // pick the built WAR
+            // Pick the most recent WAR produced by the build
             def war = sh(script: "ls -1 target/*.war | tail -n1", returnStdout: true).trim()
             if (!war) { error 'No WAR found under target/. Did the build stage run?' }
             echo "Deploying WAR: ${war}"
@@ -67,15 +65,60 @@ pipeline {
             sshagent (credentials: [env.TOMCAT_SSH_ID]) {
               sh """
                 set -e
+                # Upload to /tmp on the remote host
                 scp -o StrictHostKeyChecking=no "${war}" ${TOMCAT_USER}@${TOMCAT_HOST}:/tmp/${APP_NAME}.war
-                ssh -o StrictHostKeyChecking=no ${TOMCAT_USER}@${TOMCAT_HOST} '
-                  set -e
-                  sudo rm -f ${TOMCAT_WEBAPPS}/${APP_NAME}.war || true
-                  sudo rm -rf ${TOMCAT_WEBAPPS}/${APP_NAME} || true
-                  sudo cp /tmp/${APP_NAME}.war ${TOMCAT_WEBAPPS}/${APP_NAME}.war
-                  sudo chown -f tomcat:tomcat ${TOMCAT_WEBAPPS}/${APP_NAME}.war || true
-                  (sudo systemctl restart ${TOMCAT_SERVICE} || sudo service ${TOMCAT_SERVICE} restart || true)
-                '
+
+                # Run deployment logic remotely with a robust auto-detection of webapps dir + service
+                ssh -o StrictHostKeyChecking=no ${TOMCAT_USER}@${TOMCAT_HOST} 'bash -s' <<'EOS'
+set -e
+
+# 1) Find Tomcat webapps directory (try common locations)
+CANDIDATES=(
+  /opt/tomcat/webapps
+  /usr/share/tomcat/webapps
+  /usr/share/tomcat*/webapps
+  /usr/local/tomcat/webapps
+  /var/lib/tomcat/webapps
+  /var/lib/tomcat*/webapps
+)
+WEBAPPS_DIR=""
+for d in "${CANDIDATES[@]}"; do
+  for p in $d; do
+    if [ -d "$p" ]; then WEBAPPS_DIR="$p"; break 2; fi
+  done
+done
+if [ -z "$WEBAPPS_DIR" ]; then
+  echo "ERROR: Could not locate Tomcat webapps directory on $(hostname)." >&2
+  echo "Hint: run 'sudo find / -maxdepth 3 -type d -name webapps 2>/dev/null' to locate it." >&2
+  exit 1
+fi
+echo "Using WEBAPPS_DIR: $WEBAPPS_DIR"
+
+# 2) Drop new WAR
+sudo rm -f  "$WEBAPPS_DIR/${APP_NAME}.war" || true
+sudo rm -rf "$WEBAPPS_DIR/${APP_NAME}"     || true
+sudo cp /tmp/${APP_NAME}.war "$WEBAPPS_DIR/${APP_NAME}.war"
+
+# 3) Fix ownership if a 'tomcat' user/group exists (best-effort)
+if id tomcat >/dev/null 2>&1; then
+  sudo chown tomcat:tomcat "$WEBAPPS_DIR/${APP_NAME}.war" || true
+fi
+
+# 4) Restart Tomcat if we can detect a service; otherwise rely on auto-deploy
+set +e
+for svc in tomcat tomcat9 tomcat8 tomcat7; do
+  if systemctl list-unit-files | grep -q "^$svc\\.service"; then
+    echo "Restarting service: $svc (systemd)"
+    sudo systemctl restart "$svc" && exit 0
+  fi
+  if command -v service >/dev/null 2>&1 && service "$svc" status >/dev/null 2>&1; then
+    echo "Restarting service: $svc (SysV)"
+    sudo service "$svc" restart && exit 0
+  fi
+done
+echo "No known Tomcat service found; assuming auto-deploy is enabled."
+exit 0
+EOS
               """
             }
           }
