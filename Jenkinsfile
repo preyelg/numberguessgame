@@ -11,8 +11,8 @@ pipeline {
     REPO_URL        = 'https://github.com/preyelg/numberguessgame.git'
     REPO_BRANCH     = 'new'
     SONARQUBE_SERVER= 'SonarQube'         // Must match Manage Jenkins → Configure System name
-    NEXUS_URL       = 'http://54.157.3.135:8081'
-    NEXUS_REPO      = 'maven-releases'
+    NEXUS_URL       = 'http://18.188.63.155:8081/nexus'
+    NEXUS_REPO      = 'https://github.com/preyelg/numberguessgame.git'
     NEXUS_CRED_ID   = 'nexus-cred'
 
     TOMCAT_HOST     = '18.220.246.223'
